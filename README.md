@@ -1,6 +1,8 @@
 Go MySQL Replay
 ===============
 
+**This fork of the [original](https://github.com/dveeden/go-mysql-replay) contains a critical fix to support true parallel sessions.**
+
 Replays statements from a traffic dump or captures from Performance Schema.
 
 WARNING: This tool will execute operations that can change your data if those
