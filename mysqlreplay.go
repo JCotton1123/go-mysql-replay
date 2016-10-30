@@ -16,14 +16,14 @@ import (
 )
 
 type Configuration struct {
-        Dsn string
+    Dsn string
 }
 
-type ReplayStatement struct {
-    session int
-    epoch   float64
-    stmt    string
-    cmd     uint8
+type SqlCommand struct {
+    sessionid int
+    epoch     float64
+    stmt      string
+    cmd       uint8
 }
 
 func timefromfloat(epoch float64) time.Time {
@@ -33,90 +33,30 @@ func timefromfloat(epoch float64) time.Time {
     return epoch_time
 }
 
-func parsefields(line []string) (ReplayStatement, error) {
+func parsefields(line []string) (SqlCommand, error) {
     if len(line) != 4 {
-        return ReplayStatement{}, fmt.Errorf("Invalid data line. Length = %d", len(line))
+        return SqlCommand{}, fmt.Errorf("Invalid data line. Length = %d", len(line))
     }
 
     sessionid, err := strconv.Atoi(line[0])
     if err != nil {
-        return ReplayStatement{}, fmt.Errorf("Failed to parse session id with err: %s", err)
+        return SqlCommand{}, fmt.Errorf("Failed to parse session id with err: %s", err)
     }
 
     epoch, err := strconv.ParseFloat(line[1], 64)
     if err != nil {
-        return ReplayStatement{}, fmt.Errorf("Failed to parse epoch with err: %s", err)
+        return SqlCommand{}, fmt.Errorf("Failed to parse epoch with err: %s", err)
     }
 
     cmd_src, err := strconv.Atoi(line[2])
     if err != nil {
-        return ReplayStatement{}, fmt.Errorf("Failed to parse cmd with err: %s", err)
+        return SqlCommand{}, fmt.Errorf("Failed to parse cmd with err: %s", err)
     }
     cmd := uint8(cmd_src)
 
     var stmt string = line[3]
 
-    return ReplayStatement{session: sessionid, epoch: epoch, cmd: cmd, stmt: stmt}, nil
-}
-
-func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
-    starttime time.Time, config Configuration, wg sync.WaitGroup) {
-    fmt.Printf("[session %d] NEW SESSION\n", session)
-
-    db, err := sql.Open("mysql", config.Dsn)
-    if err != nil {
-        panic(err.Error())
-    }
-    dbopen := true
-    defer db.Close()
-
-    last_stmt_epoch := firstepoch
-    for {
-        pkt := <-c
-        if last_stmt_epoch != 0.0 {
-            firsttime := timefromfloat(firstepoch)
-            pkttime := timefromfloat(pkt.epoch)
-            delaytime_orig := pkttime.Sub(firsttime)
-            mydelay := time.Since(starttime)
-            delaytime_new := delaytime_orig - mydelay
-
-            fmt.Printf("[session %d] Sleeptime: %s\n", session,
-                delaytime_new)
-            time.Sleep(delaytime_new)
-        }
-        last_stmt_epoch = pkt.epoch
-        switch pkt.cmd {
-        case 14: // Ping
-            continue
-        case 1: // Quit
-            fmt.Printf("[session %d] COMMAND REPLAY: QUIT\n", session)
-            dbopen = false
-            db.Close()
-        case 3: // Query
-            if dbopen == false {
-                fmt.Printf("[session %d] RECONNECT\n", session)
-                db, err = sql.Open("mysql", config.Dsn)
-                if err != nil {
-                    panic(err.Error())
-                }
-                dbopen = true
-            }
-            fmt.Printf("[session %d] STATEMENT REPLAY: %s\n", session,
-                   pkt.stmt)
-            _, err := db.Exec(pkt.stmt)
-            if err != nil {
-                if mysqlError, ok := err.(*mysql.MySQLError); ok {
-                    if mysqlError.Number == 1205 { // Lock wait timeout
-                        fmt.Printf("ERROR IGNORED: %s",
-                            err.Error())
-                    }
-                } else {
-                    panic(err.Error())
-                }
-            }
-        }
-    }
-        defer wg.Done()
+    return SqlCommand{sessionid: sessionid, epoch: epoch, cmd: cmd, stmt: stmt}, nil
 }
 
 func main() {
@@ -125,12 +65,11 @@ func main() {
     config := Configuration{}
     err := confdec.Decode(&config)
     if err != nil {
-        fmt.Printf("Error reading configuration from "+
+        fmt.Printf("[main] Error reading configuration from "+
             "'./go-mysql-replay.conf.json': %s\n", err)
     }
 
-    fileflag := flag.String("f", "./test.dat",
-        "Path to datafile for replay")
+    fileflag := flag.String("f", "./test.dat", "Path to datafile for replay")
     flag.Parse()
 
     datFile, err := os.Open(*fileflag)
@@ -138,47 +77,78 @@ func main() {
         fmt.Println(err)
     }
 
+    var line_num uint32 = 0
     reader := csv.NewReader(datFile)
     reader.Comma = '\t'
-    var lineNum uint32 = 0
+
+    db, err := sql.Open("mysql", config.Dsn)
+    if err != nil {
+        panic(err.Error())
+    }
+    db.SetMaxIdleConns(100)
+
+    var wg sync.WaitGroup
 
     var firstepoch float64 = 0.0
     starttime := time.Now()
-    sessions := make(map[int]chan ReplayStatement)
+    var last_stmt_epoch = 0.0
 
-    var wg sync.WaitGroup
     for {
         line, err := reader.Read()
         if err == io.EOF {
             break
         }
-        lineNum++
-        if err != nil {
-            fmt.Println("[main] Error reading line", lineNum, "with error", err)
-            continue
-        }
+        line_num++
 
-        pkt, err := parsefields(line)
+        sqlcmd, err := parsefields(line)
         if err != nil {
-            fmt.Println("[main] Error parsing line", lineNum, "with error", err)
+            fmt.Println("[main] Error parsing line", line_num, "with error", err)
             continue
         }
 
         if firstepoch == 0.0 {
-            firstepoch = pkt.epoch
-        }
-
-        if sessions[pkt.session] != nil {
-            sessions[pkt.session] <- pkt
+            firstepoch = sqlcmd.epoch
+        } else if last_stmt_epoch == sqlcmd.epoch {
+            //No sleeping
         } else {
-            wg.Add(1)
-            sess := make(chan ReplayStatement, 10000)
-            sessions[pkt.session] = sess
-            go mysqlsession(sessions[pkt.session], pkt.session,
-                firstepoch, starttime, config, wg)
-            sessions[pkt.session] <- pkt
+            firsttime := timefromfloat(firstepoch)
+            pkttime := timefromfloat(sqlcmd.epoch)
+            delaytime_orig := pkttime.Sub(firsttime)
+            mydelay := time.Since(starttime)
+            delaytime_new := delaytime_orig - mydelay
+
+            fmt.Printf("[main] Sleeptime: %s\n", delaytime_new)
+            time.Sleep(delaytime_new)
         }
+        last_stmt_epoch = sqlcmd.epoch
+        
+        
+
+        fmt.Println("[main] Worker for ", line)
+        wg.Add(1)
+        go func(cmd SqlCommand) {
+            sessionid := cmd.sessionid
+
+            switch cmd.cmd {
+                    case 3: // Query
+                        fmt.Printf("[session %d] Replay: %s\n", sessionid, cmd.stmt)
+                        _, err := db.Exec(cmd.stmt)
+                        if err != nil {
+                            if mysqlError, ok := err.(*mysql.MySQLError); ok {
+                                if mysqlError.Number == 1205 { // Lock wait timeout
+                                    fmt.Printf("ERROR IGNORED: %s",
+                                        err.Error())
+                                }
+                            } else {
+                                panic(err.Error())
+                            }
+                        }
+           }
+
+           defer wg.Done()
+
+        }(sqlcmd)
     }
-    fmt.Println("[main] Waiting for children to finish")
+    fmt.Println("[main] Waiting for children to complete.")
     wg.Wait()
 }
