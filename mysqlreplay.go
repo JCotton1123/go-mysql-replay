@@ -59,19 +59,13 @@ func parsefields(line []string) (ReplayStatement, error) {
 }
 
 func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
-    starttime time.Time, config Configuration) {
+    starttime time.Time, config Configuration, db *sql.DB) {
     fmt.Printf("[session %d] NEW SESSION\n", session)
-
-    db, err := sql.Open("mysql", config.Dsn)
-    if err != nil {
-        panic(err.Error())
-    }
-    dbopen := true
-    defer db.Close()
 
     last_stmt_epoch := firstepoch
     for {
         pkt := <-c
+
         if last_stmt_epoch != 0.0 {
             firsttime := timefromfloat(firstepoch)
             pkttime := timefromfloat(pkt.epoch)
@@ -79,40 +73,28 @@ func mysqlsession(c <-chan ReplayStatement, session int, firstepoch float64,
             mydelay := time.Since(starttime)
             delaytime_new := delaytime_orig - mydelay
 
-            fmt.Printf("[session %d] Sleeptime: %s\n", session,
-                delaytime_new)
+            fmt.Printf("[session %d] Sleeptime: %s\n", session, delaytime_new)
             time.Sleep(delaytime_new)
         }
         last_stmt_epoch = pkt.epoch
+
         switch pkt.cmd {
-        case 14: // Ping
-            continue
-        case 1: // Quit
-            fmt.Printf("[session %d] COMMAND REPLAY: QUIT\n", session)
-            dbopen = false
-            db.Close()
         case 3: // Query
-            if dbopen == false {
-                fmt.Printf("[session %d] RECONNECT\n", session)
-                db, err = sql.Open("mysql", config.Dsn)
-                if err != nil {
-                    panic(err.Error())
-                }
-                dbopen = true
-            }
-            fmt.Printf("[session %d] STATEMENT REPLAY: %s\n", session,
-                   pkt.stmt)
+            fmt.Printf("[session %d] STATEMENT REPLAY: %s\n", session, pkt.stmt)
+            query_start_time := time.Now()
             _, err := db.Exec(pkt.stmt)
+            query_time := time.Since(query_start_time)
             if err != nil {
                 if mysqlError, ok := err.(*mysql.MySQLError); ok {
                     if mysqlError.Number == 1205 { // Lock wait timeout
-                        fmt.Printf("ERROR IGNORED: %s",
-                            err.Error())
+                        fmt.Printf("[session %d] ERROR IGNORED: %s", session, err.Error())
                     }
                 } else {
+                    fmt.Printf("[session %d] Panicing with %s.\n", session, err)
                     panic(err.Error())
                 }
             }
+            fmt.Printf("[session %d] QUERY TIME: %s\n", session, query_time)
         }
     }
 }
@@ -140,9 +122,21 @@ func main() {
     reader.Comma = '\t'
     var lineNum uint32 = 0
 
+    db, err := sql.Open("mysql", config.Dsn)
+    if err != nil {
+        fmt.Printf("[main] Panicing with %s.\n", err.Error())
+        panic(err.Error())
+    }
+    defer db.Close()
+    db.SetMaxIdleConns(1)
+    db.SetMaxOpenConns(1)
+
     var firstepoch float64 = 0.0
     starttime := time.Now()
     sessions := make(map[int]chan ReplayStatement)
+    var numSessions int = 0
+
+    fmt.Println("[main] Replay started at", starttime)
 
     for {
         line, err := reader.Read()
@@ -171,11 +165,18 @@ func main() {
         } else {
             sess := make(chan ReplayStatement, 10000)
             sessions[pkt.session] = sess
-            go mysqlsession(sessions[pkt.session], pkt.session,
-                firstepoch, starttime, config)
+
+            db.SetMaxIdleConns(numSessions + 1)
+            db.SetMaxOpenConns(numSessions + 1)
+
+            go mysqlsession(sessions[pkt.session], pkt.session, firstepoch, starttime, config, db)
             sessions[pkt.session] <- pkt
+
+            numSessions++
+            fmt.Println("[main] Sessions started:", numSessions)
         }
     }
+
     fmt.Println("[main] Waiting for children to finish")
     for _, ch := range sessions {
         for {
@@ -185,4 +186,8 @@ func main() {
             time.Sleep(100 * time.Millisecond)
         }
     }
+
+    endtime := time.Now()
+    fmt.Println("[main] Replay completed at", endtime)
+    fmt.Println("[main] Elapsed time", endtime.Sub(starttime))
 }
