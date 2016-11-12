@@ -74,7 +74,7 @@ func main() {
 
     datFile, err := os.Open(*fileflag)
     if err != nil {
-        fmt.Println(err)
+        panic(err.Error())
     }
 
     var line_num uint32 = 0
