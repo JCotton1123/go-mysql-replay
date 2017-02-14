@@ -35,14 +35,17 @@ Workflow
 1. Capture data
 
 ```
-# tcpdump -i eth0 -w mysql.pcap -s0 -G 60 -W 1 'dst port 3306'
+# tcpdump -i eth0 -w "mysql%s.pcap" -s0 -G 60 'dst port 3306'
 ```
 
 -i interface
--w write to file
+
+-w write to file; include unix timestamp
+
 -s snaplen
--G seconds to run
--W number of times to run
+
+-G seconds per file
+
 
 2. Convert your data to a tab dilimtered file with tshark
 
